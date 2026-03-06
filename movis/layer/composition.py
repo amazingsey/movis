@@ -56,7 +56,7 @@ class Composition:
     """
 
     def __exit__(self, exc_type, exc_value, traceback):
-        print("BRO I QUIT!")
+        pass
 
     def __init__(
         self, size: tuple[int, int] = (1920, 1080), duration: float = 1.0, cache_directory: str = None
@@ -413,10 +413,11 @@ class Composition:
     def _write_video(
         self, start_time: float, end_time: float,
         fps: float, writer: Format.Writer,
+        bg_color: tuple[int, int, int, int] = (0, 0, 0, 255),
     ) -> None:
         times = np.arange(start_time, end_time, 1.0 / fps)
         for t in tqdm(times, total=len(times)):
-            frame = np.asarray(self(t, bg_color=(0, 0, 0, 255)))
+            frame = np.asarray(self(t, bg_color=bg_color))
             writer.append_data(frame)
         writer.close()
 
@@ -432,6 +433,7 @@ class Composition:
         fps: float = 30.0,
         audio: bool = True,
         audio_codec: str | None = None,
+        bg_color: tuple[int, int, int, int] = (0, 0, 0, 255),
     ) -> None:
         """Writes the composition's contents to a video file.
 
@@ -463,6 +465,10 @@ class Composition:
                 The codec used to encode the audio. If not specified, the default codec
                 determined by ``codec`` is used. For example, if ``codec="libx264"``,
                 the default value of ``audio_codec`` is ``aac``.
+            bg_color:
+                The background color of the video as an RGBA tuple.
+                Default is ``(0, 0, 0, 255)`` (opaque black).
+                Use ``(0, 0, 0, 0)`` for transparent background (requires RGBA-capable codec/pixelformat).
         """
         if end_time is None:
             end_time = self.duration
@@ -487,7 +493,7 @@ class Composition:
                         macro_block_size=None, ffmpeg_log_level="error",
                         input_params=input_params, output_params=output_params,
                         audio_path=audio_path, audio_codec=audio_codec)
-                    self._write_video(start_time, end_time, fps, writer)
+                    self._write_video(start_time, end_time, fps, writer, bg_color=bg_color)
         else:
             with warnings.catch_warnings():
                 # XXX: Suppress the deprecation warning from imageio-ffmpeg.
@@ -496,7 +502,7 @@ class Composition:
                     uri=str(dst_file), fps=fps, codec=codec, pixelformat=pixelformat,
                     input_params=input_params, output_params=output_params,
                     macro_block_size=None, ffmpeg_log_level="error")
-                self._write_video(start_time, end_time, fps, writer)
+                self._write_video(start_time, end_time, fps, writer, bg_color=bg_color)
 
     def render_and_play(
         self,

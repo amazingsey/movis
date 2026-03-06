@@ -60,7 +60,7 @@ class AlphaMatte(AttributesMixin):
             return None
         target_frame = self.target(time)
         if target_frame is None:
-            return mask_frame
+            return None
         opacity = float(self.opacity(time))
         return alpha_composite(
             mask_frame, target_frame, opacity=opacity,
