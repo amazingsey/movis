@@ -4,6 +4,8 @@ from typing import Hashable
 
 import numpy as np
 
+import cv2
+
 from ..attribute import Attribute, AttributesMixin, AttributeType
 from ..enum import BlendingMode, MatteMode
 from ..imgproc import alpha_composite
@@ -65,6 +67,89 @@ class AlphaMatte(AttributesMixin):
         return alpha_composite(
             mask_frame, target_frame, opacity=opacity,
             blending_mode=self.blending_mode, matte_mode=MatteMode.ALPHA)
+
+
+class AlphaClip:
+    """A layer that clips target visibility using the mask's alpha channel.
+
+    Unlike ``AlphaMatte`` (which composites target onto mask and preserves mask alpha),
+    ``AlphaClip`` multiplies the two alpha channels and leaves target RGB untouched::
+
+        output_alpha = target_alpha * mask_alpha / 255
+        output_rgb   = target_rgb
+
+    This is the correct operation for shape-clipping where both mask and target
+    may have semi-transparent regions. An optional ``size`` parameter normalizes
+    both frames to a common resolution when they differ in dimensions.
+
+    Args:
+        mask:
+            The mask layer whose alpha channel defines the clipping shape.
+            ``mask`` must comply with the ``BasicLayer`` protocol.
+        target:
+            The target layer to be clipped.
+            ``target`` must comply with the ``BasicLayer`` protocol.
+        size:
+            Optional output size as ``(width, height)``. When provided, both
+            mask and target frames are resized to this size before clipping.
+            If ``None``, the target frame's dimensions are used.
+    """
+
+    def __init__(
+            self, mask: BasicLayer, target: BasicLayer,
+            size: tuple[int, int] | None = None):
+        self.mask = mask
+        self.target = target
+        self._size = size
+
+    def get_key(self, time: float) -> tuple[Hashable, Hashable]:
+        """Get the state for the given time."""
+        mask_key = self.mask.get_key(time) if hasattr(self.mask, 'get_key') else time
+        target_key = self.target.get_key(time) if hasattr(self.target, 'get_key') else time
+        return (mask_key, target_key)
+
+    @property
+    def duration(self) -> float:
+        """The duration of the layer (derived from the target)."""
+        return self.target.duration
+
+    @property
+    def size(self) -> tuple[int, int]:
+        """The output size of the layer."""
+        return self._size or getattr(self.target, 'size', (0, 0))
+
+    def __call__(self, time: float) -> np.ndarray | None:
+        if time < 0 or self.duration <= time:
+            return None
+        mask_frame = self.mask(time)
+        target_frame = self.target(time)
+        if target_frame is None:
+            return None
+        if mask_frame is None:
+            return target_frame
+
+        # Determine output dimensions
+        if self._size:
+            ow, oh = self._size
+        else:
+            oh, ow = target_frame.shape[:2]
+
+        # Resize both frames to output size as needed
+        th, tw = target_frame.shape[:2]
+        if (tw, th) != (ow, oh):
+            target_frame = cv2.resize(
+                target_frame, (ow, oh), interpolation=cv2.INTER_AREA)
+        mh, mw = mask_frame.shape[:2]
+        if (mw, mh) != (ow, oh):
+            mask_frame = cv2.resize(
+                mask_frame, (ow, oh), interpolation=cv2.INTER_AREA)
+
+        out = target_frame.copy()
+        out[:, :, 3] = (
+            target_frame[:, :, 3].astype(np.float32)
+            * mask_frame[:, :, 3].astype(np.float32) / 255
+        ).astype(np.uint8)
+        return out
 
 
 class LuminanceMatte:
