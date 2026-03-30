@@ -31,6 +31,44 @@ class FillColor(AttributesMixin):
         return np.concatenate([rgb_image, alpha_image], axis=2)
 
 
+class Grayscale(AttributesMixin):
+    """Convert the image to grayscale using luminance-weighted conversion (BT.601).
+
+    Uses the standard weights (0.299R + 0.587G + 0.114B) — the same conversion
+    used by Photoshop's grayscale mode. Preserves contrast between colors of
+    different brightness (e.g. yellow on red).
+
+    Args:
+        strength:
+            Blend factor in the range ``[0, 1]``. 0.0 = original color,
+            1.0 = fully grayscale. Defaults to 1.0.
+
+    Animatable Attributes:
+        ``strength``
+    """
+
+    def __init__(self, strength: float = 1.0):
+        self.strength = Attribute(strength, AttributeType.SCALAR, range=(0., 1.))
+
+    def __call__(self, prev_image: np.ndarray, time: float) -> np.ndarray:
+        assert prev_image.ndim == 3
+        assert prev_image.shape[2] == 4, f'prev_image must be RGBA image, but {prev_image.shape}'
+        rgb = prev_image[:, :, :3]
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        gray_rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+        s = np.float32(self.strength(time))
+        if s >= 1.0:
+            blended = gray_rgb
+        elif s <= 0.0:
+            blended = rgb
+        else:
+            blended = np.clip(
+                rgb.astype(np.float32) * (1 - s) + gray_rgb.astype(np.float32) * s,
+                0, 255
+            ).astype(np.uint8)
+        return np.concatenate([blended, prev_image[:, :, 3:]], axis=2)
+
+
 class HSLShift(AttributesMixin):
     """Shift hue, saturation, and luminance of the image.
 
