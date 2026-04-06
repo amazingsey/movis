@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 import tempfile
 import warnings
 from contextlib import contextmanager
@@ -473,6 +475,19 @@ class Composition:
             writer.append_data(frame)
         writer.close()
 
+    def _write_video_pipe(
+        self, start_time: float, end_time: float,
+        fps: float, proc: 'subprocess.Popen',
+        bg_color: tuple[int, int, int, int] = (0, 0, 0, 255),
+    ) -> None:
+        """Write frames directly to FFmpeg stdin pipe (faster than imageio)."""
+        times = np.arange(start_time, end_time, 1.0 / fps)
+        for t in tqdm(times, total=len(times)):
+            frame = np.asarray(self(t, bg_color=bg_color))
+            proc.stdin.write(frame.tobytes())
+        proc.stdin.close()
+        proc.wait()
+
     def write_video(
         self,
         dst_file: str | PathLike,
@@ -555,6 +570,85 @@ class Composition:
                     input_params=input_params, output_params=output_params,
                     macro_block_size=None, ffmpeg_log_level="error")
                 self._write_video(start_time, end_time, fps, writer, bg_color=bg_color)
+
+    def write_video_fast(
+        self,
+        dst_file: str | PathLike,
+        start_time: float = 0.0,
+        end_time: float | None = None,
+        codec: str = "libx264",
+        pixelformat: str = "yuv420p",
+        output_params: list[str] | None = None,
+        fps: float = 30.0,
+        audio: bool = True,
+        audio_codec: str | None = None,
+        bg_color: tuple[int, int, int, int] = (0, 0, 0, 255),
+    ) -> None:
+        """Write video using direct FFmpeg stdin pipe (faster than imageio).
+
+        Pipes raw RGBA frames directly to FFmpeg, which encodes in a separate
+        process — frame generation and encoding run in parallel.
+        """
+        import os
+        if end_time is None:
+            end_time = self.duration
+
+        W, H = self.size
+        ffmpeg_bin = shutil.which('ffmpeg') or 'ffmpeg'
+
+        # Determine pixel format for raw input
+        has_alpha = bg_color[3] < 255 or pixelformat in ('yuva444p', 'yuva420p', 'rgba')
+        raw_pix_fmt = 'bgra' if has_alpha else 'bgra'  # movis outputs BGRA RGBA arrays
+
+        # Handle audio
+        audio_path = None
+        temp_dir = None
+        if audio:
+            audio_array = self.get_audio(start_time, end_time)
+            if audio_array is not None:
+                temp_dir = tempfile.mkdtemp()
+                audio_path = os.path.join(temp_dir, 'audio.wav')
+                sf.write(audio_path, audio_array.transpose(),
+                         samplerate=AUDIO_SAMPLING_RATE, subtype='PCM_16')
+
+        # Build FFmpeg command
+        cmd = [ffmpeg_bin, '-y',
+               '-f', 'rawvideo',
+               '-pix_fmt', 'rgba',
+               '-s', f'{W}x{H}',
+               '-r', str(fps),
+               '-i', 'pipe:0']
+
+        if audio_path:
+            cmd.extend(['-i', audio_path])
+
+        cmd.extend(['-c:v', codec])
+        if output_params:
+            cmd.extend(output_params)
+        cmd.extend(['-pix_fmt', pixelformat])
+
+        if audio_path:
+            cmd.extend(['-c:a', audio_codec or 'aac'])
+            cmd.extend(['-map', '0:v', '-map', '1:a'])
+
+        cmd.append(str(dst_file))
+
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        try:
+            self._write_video_pipe(start_time, end_time, fps, proc, bg_color=bg_color)
+        except BrokenPipeError:
+            pass
+
+        if proc.returncode and proc.returncode != 0:
+            stderr = proc.stderr.read().decode() if proc.stderr else ''
+            raise RuntimeError(f"FFmpeg failed (exit {proc.returncode}): {stderr[-500:]}")
+
+        # Cleanup temp audio
+        if temp_dir:
+            import shutil as _shutil
+            _shutil.rmtree(temp_dir, ignore_errors=True)
 
     def render_and_play(
         self,
@@ -695,6 +789,13 @@ class LayerItem:
         self.visible: bool = visible
         self.audio: bool = audio
         self._effects: list[Effect] = []
+
+        # Static layer caching
+        self._static_ranges: list[tuple[float, float]] | None = None  # Computed lazily
+        self._static_cache_fg: np.ndarray | None = None
+        self._static_cache_offset: tuple[int, int] | None = None
+        self._static_cache_opacity: float = 1.0
+        self._static_cache_range_idx: int = -1  # Which range produced the cache
 
     @property
     def duration(self) -> float:
@@ -854,6 +955,77 @@ class LayerItem:
             cache[key] = fg_image
         return fg_image
 
+    def _compute_static_ranges(self) -> list[tuple[float, float]]:
+        """Pre-compute time ranges where ALL transform properties are constant.
+
+        A property is constant when:
+        - No motion and no functions (always static)
+        - Has motion with consecutive identical keyframe values (hold segments)
+
+        Returns list of (start, end) tuples in layer-local time.
+        """
+        attrs = self.transform.attributes  # position, scale, rotation, opacity, anchor_point
+        per_attr_ranges = []
+
+        for attr_name, attr in attrs.items():
+            if attr._motion is None and len(attr._functions) == 0:
+                # No animation at all — static for entire duration
+                per_attr_ranges.append([(self.start_time, self.end_time)])
+                continue
+
+            if len(attr._functions) > 0:
+                # Has modifier functions (wobble, bounce) — can't predict
+                return []
+
+            motion = attr._motion
+            if motion is None or len(motion.keyframes) < 2:
+                per_attr_ranges.append([(self.start_time, self.end_time)])
+                continue
+
+            # Find hold segments: consecutive keyframes with identical values
+            ranges = []
+            i = 0
+            while i < len(motion.keyframes):
+                val = motion.values[i]
+                j = i + 1
+                while j < len(motion.keyframes) and np.array_equal(motion.values[j], val):
+                    j += 1
+                if j > i + 1:
+                    # Found a hold segment from keyframes[i] to keyframes[j-1]
+                    ranges.append((motion.keyframes[i], motion.keyframes[j - 1]))
+                i = j if j > i + 1 else i + 1
+
+            # Also static before first keyframe and after last keyframe
+            if motion.keyframes[0] > self.start_time:
+                ranges.insert(0, (self.start_time, motion.keyframes[0]))
+            if motion.keyframes[-1] < self.end_time:
+                ranges.append((motion.keyframes[-1], self.end_time))
+
+            per_attr_ranges.append(ranges)
+
+        if not per_attr_ranges:
+            return []
+
+        # Intersect all attribute ranges to find times where ALL are static
+        result = per_attr_ranges[0]
+        for attr_ranges in per_attr_ranges[1:]:
+            result = _intersect_ranges(result, attr_ranges)
+            if not result:
+                return []
+
+        # Filter out tiny ranges (< 2 frames at 30fps)
+        return [(s, e) for s, e in result if e - s > 0.05]
+
+    def _get_static_range_idx(self, layer_time: float) -> int:
+        """Check if layer_time falls within a pre-computed static range.
+        Returns range index or -1."""
+        if self._static_ranges is None:
+            self._static_ranges = self._compute_static_ranges()
+        for i, (start, end) in enumerate(self._static_ranges):
+            if start <= layer_time <= end:
+                return i
+        return -1
+
     def _composite(
         self, bg_image: np.ndarray, time: float,
         parent: tuple[int, int] = (0, 0),
@@ -864,6 +1036,18 @@ class LayerItem:
         layer_time = time - self.offset
         if layer_time < self.start_time or self.end_time <= layer_time:
             return bg_image
+
+        # Static layer fast path: reuse cached transform result
+        range_idx = self._get_static_range_idx(layer_time)
+        if range_idx >= 0 and self._static_cache_fg is not None and self._static_cache_range_idx == range_idx:
+            bg_image = alpha_composite(
+                bg_image, self._static_cache_fg,
+                position=(self._static_cache_offset[0] - parent[0],
+                          self._static_cache_offset[1] - parent[1]),
+                opacity=self._static_cache_opacity,
+                blending_mode=self.transform.blending_mode)
+            return bg_image
+
         fg_image = self._get_fg_image(time, cache)
         if fg_image is None:
             return bg_image
@@ -877,6 +1061,13 @@ class LayerItem:
         fg_image_transformed = cv2.warpAffine(
             fg_image, affine_matrix_fixed, dsize=(W, H),
             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+
+        # Cache if we're in a static range
+        if range_idx >= 0:
+            self._static_cache_fg = fg_image_transformed
+            self._static_cache_offset = (offset_x, offset_y)
+            self._static_cache_opacity = p.opacity
+            self._static_cache_range_idx = range_idx
 
         # Composite bg_image and fg_image
         bg_image = alpha_composite(
@@ -934,6 +1125,24 @@ def get_affine_matrix(layer_size: tuple[int, int], p: TransformValue) -> np.ndar
     T2 = _get_T2(p, layer_size, p.origin_point)
     affine_matrix = T1 @ SR @ T2
     return affine_matrix[:2]
+
+
+def _intersect_ranges(
+    a: list[tuple[float, float]], b: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """Intersect two lists of (start, end) ranges."""
+    result = []
+    i, j = 0, 0
+    while i < len(a) and j < len(b):
+        start = max(a[i][0], b[j][0])
+        end = min(a[i][1], b[j][1])
+        if start < end:
+            result.append((start, end))
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return result
 
 
 def _get_fixed_affine_matrix(
