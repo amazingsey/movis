@@ -483,10 +483,15 @@ class Composition:
         """Write frames directly to FFmpeg stdin pipe (faster than imageio)."""
         times = np.arange(start_time, end_time, 1.0 / fps)
         for t in tqdm(times, total=len(times)):
-            frame = np.asarray(self(t, bg_color=bg_color))
-            proc.stdin.write(frame.tobytes())
-        proc.stdin.close()
-        proc.wait()
+            frame = np.ascontiguousarray(self(t, bg_color=bg_color))
+            try:
+                proc.stdin.write(frame.tobytes())
+            except BrokenPipeError:
+                break
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
 
     def write_video(
         self,
@@ -634,16 +639,17 @@ class Composition:
         cmd.append(str(dst_file))
 
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         try:
             self._write_video_pipe(start_time, end_time, fps, proc, bg_color=bg_color)
         except BrokenPipeError:
             pass
 
+        proc.wait(timeout=30)
+
         if proc.returncode and proc.returncode != 0:
-            stderr = proc.stderr.read().decode() if proc.stderr else ''
-            raise RuntimeError(f"FFmpeg failed (exit {proc.returncode}): {stderr[-500:]}")
+            raise RuntimeError(f"FFmpeg failed (exit {proc.returncode})")
 
         # Cleanup temp audio
         if temp_dir:
