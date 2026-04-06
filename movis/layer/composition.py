@@ -22,6 +22,11 @@ from ..imgproc import alpha_composite
 from ..transform import Transform, TransformValue
 from .protocol import AUDIO_BLOCK_SIZE, AUDIO_SAMPLING_RATE, AudioLayer, Layer
 
+try:
+    from ..gpu_compositor import GPUCompositor, GPU_AVAILABLE
+except ImportError:
+    GPU_AVAILABLE = False
+
 
 class Composition:
     """A base layer that integrates multiple layers into one video.
@@ -75,6 +80,10 @@ class Composition:
         assert isinstance(size, tuple) and len(size) == 2, "size must be a tuple of length 2"
         assert size[0] > 0 and size[1] > 0, "size must be positive"
         self._size = size
+
+        # GPU compositing — enabled by default when available
+        self._use_gpu = GPU_AVAILABLE
+        self._gpu_compositor = GPUCompositor() if GPU_AVAILABLE else None
 
     @property
     def size(self) -> tuple[int, int]:
@@ -368,14 +377,57 @@ class Composition:
             else:
                 del self._cache[key]
 
-        frame = np.empty(current_shape + (4,), dtype=np.uint8)
-        frame[:, :, :] = np.asarray(bg_color, dtype=np.uint8).reshape(1, 1, 4)
-        for layer_item in self._layers:
-            frame = layer_item._composite(
-                frame, time, preview_level=self._preview_level,
-                cache=self._cache)
+        # GPU path: composite all layers on GPU, one transfer at end
+        if GPU_AVAILABLE and self._use_gpu and L == 1:
+            frame = self._render_frame_gpu(time, bg_color)
+        else:
+            # CPU path (original)
+            frame = np.empty(current_shape + (4,), dtype=np.uint8)
+            frame[:, :, :] = np.asarray(bg_color, dtype=np.uint8).reshape(1, 1, 4)
+            for layer_item in self._layers:
+                frame = layer_item._composite(
+                    frame, time, preview_level=self._preview_level,
+                    cache=self._cache)
+
         self._cache[key] = frame
         return frame
+
+    def _render_frame_gpu(
+        self, time: float,
+        bg_color: tuple[int, int, int, int] = (0, 0, 0, 0),
+    ) -> np.ndarray:
+        """Render frame with GPU-accelerated compositing."""
+        compositor = self._gpu_compositor
+        compositor.begin_frame(self.size[0], self.size[1], bg_color)
+
+        for layer_item in self._layers:
+            layer_time = time - layer_item.offset
+            if layer_time < layer_item.start_time or layer_item.end_time <= layer_time:
+                continue
+
+            # Get foreground image (CPU — layers unchanged)
+            fg_image = layer_item._get_fg_image(time, self._cache)
+            if fg_image is None:
+                continue
+
+            # Get transform values
+            p = layer_item.transform.get_current_value(layer_time)
+
+            # Build affine matrix
+            result = _get_fixed_affine_matrix(
+                fg_image, p, preview_level=1)
+            if result is None:
+                continue
+            affine_matrix_fixed, (W, H), (offset_x, offset_y) = result
+
+            # Composite on GPU — one kernel launch per layer
+            compositor.composite_layer(
+                fg_image, affine_matrix_fixed,
+                (offset_x, offset_y), p.opacity
+            )
+
+        # One GPU→CPU transfer
+        return compositor.end_frame()
 
     def get_audio(self, start_time: float, end_time: float) -> np.ndarray | None:
         """Returns the audio of the composition as a numpy array.
