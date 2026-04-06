@@ -645,8 +645,8 @@ class Composition:
         # Write frames
         self._write_video_pipe(start_time, end_time, fps, proc, bg_color=bg_color)
 
-        # Wait for FFmpeg to finish
-        _, stderr_data = proc.communicate(timeout=30)
+        # Wait for FFmpeg to finish encoding remaining buffered frames
+        _, stderr_data = proc.communicate(timeout=600)
 
         if proc.returncode != 0:
             err_msg = stderr_data.decode() if stderr_data else 'Unknown error'
