@@ -27,11 +27,6 @@ try:
 except ImportError:
     GPU_AVAILABLE = False
 
-try:
-    from ..njit_core import warp_affine_njit, alpha_composite_cpu, HAS_NUMBA
-except ImportError:
-    HAS_NUMBA = False
-
 
 class Composition:
     """A base layer that integrates multiple layers into one video.
@@ -89,12 +84,6 @@ class Composition:
         # GPU compositing — enabled by default when available
         self._use_gpu = GPU_AVAILABLE
         self._gpu_compositor = GPUCompositor() if GPU_AVAILABLE else None
-
-        # Numba njit warmup (once per process)
-        if HAS_NUMBA and not getattr(Composition, '_njit_warmed', False):
-            from ..njit_core import warmup_njit
-            warmup_njit()
-            Composition._njit_warmed = True
 
     @property
     def size(self) -> tuple[int, int]:
@@ -885,18 +874,6 @@ class LayerItem:
         if result is None:
             return bg_image
         affine_matrix_fixed, (W, H), (offset_x, offset_y) = result
-
-        if HAS_NUMBA and p.blending_mode == BlendingMode.NORMAL:
-            # Numba njit fast path: fused warp + composite on CPU (parallel)
-            fg_image_transformed = warp_affine_njit(
-                fg_image, affine_matrix_fixed, W, H)
-            pos_x = offset_x - parent[0]
-            pos_y = offset_y - parent[1]
-            bg_image = alpha_composite_cpu(
-                bg_image, fg_image_transformed, pos_x, pos_y, p.opacity)
-            return bg_image
-
-        # Fallback: OpenCV + PIL
         fg_image_transformed = cv2.warpAffine(
             fg_image, affine_matrix_fixed, dsize=(W, H),
             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
