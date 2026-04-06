@@ -18,6 +18,7 @@ import numpy as np
 
 try:
     from numba import cuda
+    from numba.core.errors import NumbaPerformanceWarning
     GPU_AVAILABLE = cuda.is_available()
 except ImportError:
     GPU_AVAILABLE = False
@@ -128,13 +129,22 @@ if GPU_AVAILABLE:
             bg[y, x, 3] = int(min(255.0, out_a * 255.0))
 
     def warmup():
-        """JIT-compile kernels with dummy data. Call once at init."""
-        dummy_bg = cuda.to_device(np.zeros((2, 2, 4), dtype=np.uint8))
-        dummy_fg = cuda.to_device(np.zeros((2, 2, 4), dtype=np.uint8))
-        dummy_affine = cuda.to_device(np.eye(2, 3, dtype=np.float32))
-        _transform_composite_kernel[(1, 1), (2, 2)](dummy_bg, dummy_fg, dummy_affine, 1.0, 0, 0, 2, 2)
-        _simple_composite_kernel[(1, 1), (2, 2)](dummy_bg, dummy_fg, 1.0, 0, 0, 2, 2)
-        cuda.synchronize()
+        """JIT-compile kernels with full-size data to avoid grid size warnings."""
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', '.*Grid size.*', category=NumbaPerformanceWarning)
+            # Use 1920x1080 so the compiled kernel matches production grid size
+            dummy_bg = cuda.to_device(np.zeros((1080, 1920, 4), dtype=np.uint8))
+            dummy_fg = cuda.to_device(np.zeros((100, 100, 4), dtype=np.uint8))
+            dummy_affine = cuda.to_device(np.eye(2, 3, dtype=np.float32))
+            blocks = _get_blocks(1920, 1080)
+            _transform_composite_kernel[blocks, THREADS_PER_BLOCK](
+                dummy_bg, dummy_fg, dummy_affine, 1.0, 0, 0, 100, 100
+            )
+            _simple_composite_kernel[blocks, THREADS_PER_BLOCK](
+                dummy_bg, dummy_fg, 1.0, 0, 0, 100, 100
+            )
+            cuda.synchronize()
 
 else:
     def warmup():
@@ -167,6 +177,8 @@ class GPUCompositor:
 
     def ensure_warmed_up(self):
         if not self._warmed_up and GPU_AVAILABLE:
+            import warnings
+            warnings.filterwarnings('ignore', '.*Grid size.*', category=NumbaPerformanceWarning)
             warmup()
             self._warmed_up = True
 
