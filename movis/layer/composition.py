@@ -589,10 +589,10 @@ class Composition:
         audio_codec: str | None = None,
         bg_color: tuple[int, int, int, int] = (0, 0, 0, 255),
     ) -> None:
-        """Write video using direct FFmpeg stdin pipe (faster than imageio).
+        """Write video using direct FFmpeg stdin pipe (matches moviepy pattern).
 
-        Pipes raw RGBA frames directly to FFmpeg, which encodes in a separate
-        process — frame generation and encoding run in parallel.
+        Pipes raw RGBA frames directly to FFmpeg stdin. Encoding runs in a
+        separate process in parallel with frame generation.
         """
         import os
         if end_time is None:
@@ -601,11 +601,7 @@ class Composition:
         W, H = self.size
         ffmpeg_bin = shutil.which('ffmpeg') or 'ffmpeg'
 
-        # Determine pixel format for raw input
-        has_alpha = bg_color[3] < 255 or pixelformat in ('yuva444p', 'yuva420p', 'rgba')
-        raw_pix_fmt = 'bgra' if has_alpha else 'bgra'  # movis outputs BGRA RGBA arrays
-
-        # Handle audio
+        # Handle audio first (write to temp file)
         audio_path = None
         temp_dir = None
         if audio:
@@ -616,40 +612,45 @@ class Composition:
                 sf.write(audio_path, audio_array.transpose(),
                          samplerate=AUDIO_SAMPLING_RATE, subtype='PCM_16')
 
-        # Build FFmpeg command
-        cmd = [ffmpeg_bin, '-y',
-               '-f', 'rawvideo',
-               '-pix_fmt', 'rgba',
-               '-s', f'{W}x{H}',
-               '-r', str(fps),
-               '-i', 'pipe:0']
+        # Build FFmpeg command (following moviepy's proven pattern)
+        cmd = [
+            ffmpeg_bin, '-y',
+            '-loglevel', 'error',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-s', f'{W}x{H}',
+            '-pix_fmt', 'rgba',
+            '-r', f'{fps:.02f}',
+            '-an',          # No audio in raw input
+            '-i', '-',      # stdin
+        ]
 
         if audio_path:
-            cmd.extend(['-i', audio_path])
+            cmd.extend(['-i', audio_path, '-acodec', audio_codec or 'aac'])
 
-        cmd.extend(['-c:v', codec])
+        cmd.extend(['-vcodec', codec])
         if output_params:
             cmd.extend(output_params)
-        cmd.extend(['-pix_fmt', pixelformat])
 
-        if audio_path:
-            cmd.extend(['-c:a', audio_codec or 'aac'])
-            cmd.extend(['-map', '0:v', '-map', '1:a'])
+        # Output pixel format
+        if pixelformat not in ('yuva444p', 'yuva420p', 'rgba'):
+            cmd.extend(['-pix_fmt', pixelformat])
 
         cmd.append(str(dst_file))
 
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-        try:
-            self._write_video_pipe(start_time, end_time, fps, proc, bg_color=bg_color)
-        except BrokenPipeError:
-            pass
+        # Write frames
+        self._write_video_pipe(start_time, end_time, fps, proc, bg_color=bg_color)
 
-        proc.wait(timeout=30)
+        # Wait for FFmpeg to finish
+        _, stderr_data = proc.communicate(timeout=30)
 
-        if proc.returncode and proc.returncode != 0:
-            raise RuntimeError(f"FFmpeg failed (exit {proc.returncode})")
+        if proc.returncode != 0:
+            err_msg = stderr_data.decode() if stderr_data else 'Unknown error'
+            raise RuntimeError(f"FFmpeg failed (exit {proc.returncode}): {err_msg[-500:]}")
 
         # Cleanup temp audio
         if temp_dir:
