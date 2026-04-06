@@ -7,6 +7,11 @@ import numpy as np
 
 from .enum import AttributeType, Easing
 
+try:
+    from .njit_core import interpolate_keyframes, HAS_NUMBA
+except ImportError:
+    HAS_NUMBA = False
+
 
 def linear(t: float) -> float:
     return t
@@ -140,6 +145,42 @@ class Motion:
         self.init_value: np.ndarray | None = transform_to_numpy(init_value, value_type) \
             if init_value is not None else None
         self.value_type = value_type
+        self._njit_arrays = None  # cached numpy arrays for njit path
+        self._njit_dirty = True   # invalidated on append/extend/clear
+
+    def _invalidate_njit_cache(self):
+        self._njit_dirty = True
+        self._njit_arrays = None
+
+    def _get_njit_arrays(self):
+        """Convert keyframes/values/easings to numpy arrays for njit interpolation."""
+        if self._njit_arrays is not None and not self._njit_dirty:
+            return self._njit_arrays
+
+        kf = np.array(self.keyframes, dtype=np.float64)
+        vals = np.array([v.flatten() for v in self.values], dtype=np.float64)
+
+        # Convert easing callables to (type_code, exponent) pairs
+        etypes = np.empty(len(self.easings), dtype=np.int32)
+        ens = np.empty(len(self.easings), dtype=np.int32)
+        for i, e in enumerate(self.easings):
+            if e is linear or (hasattr(e, '__name__') and e.__name__ == 'linear'):
+                etypes[i], ens[i] = 0, 1
+            elif isinstance(e, EaseIn):
+                etypes[i], ens[i] = 1, e.n
+            elif isinstance(e, EaseOut):
+                etypes[i], ens[i] = 2, e.n
+            elif isinstance(e, EaseInOut):
+                etypes[i], ens[i] = 3, e.n
+            elif e is flat or (hasattr(e, '__name__') and e.__name__ == 'flat'):
+                etypes[i], ens[i] = 4, 1
+            else:
+                # Unknown easing — fall back to linear
+                etypes[i], ens[i] = 0, 1
+
+        self._njit_arrays = (kf, vals, etypes, ens)
+        self._njit_dirty = False
+        return self._njit_arrays
 
     def __len__(self) -> int:
         return len(self.keyframes)
@@ -151,6 +192,14 @@ class Motion:
             raise ValueError("No keyframes")
         elif len(self.keyframes) == 1:
             return self.values[0]
+
+        # Use njit fast path when available and no custom easing functions
+        if HAS_NUMBA and len(self.keyframes) >= 2:
+            try:
+                kf, vals, etypes, ens = self._get_njit_arrays()
+                return interpolate_keyframes(layer_time, kf, vals, etypes, ens)
+            except Exception:
+                pass  # Fall through to Python path
 
         if layer_time < self.keyframes[0]:
             return self.values[0]
@@ -197,6 +246,7 @@ class Motion:
         else:
             raise ValueError(f"Invalid easing type: {type(easing)}")
         self.easings.insert(i, easing_func)
+        self._invalidate_njit_cache()
         return self
 
     def extend(
@@ -272,12 +322,14 @@ class Motion:
         self.keyframes = list(keyframes_sorted)
         self.values = list(values_sorted)
         self.easings = list(easings_sorted)
+        self._invalidate_njit_cache()
         return self
 
     def clear(self) -> "Motion":
         self.keyframes = []
         self.values = []
         self.easings = []
+        self._invalidate_njit_cache()
         return self
 
 
