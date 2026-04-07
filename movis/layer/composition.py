@@ -62,21 +62,37 @@ class Composition:
             The duration along the time axis for the composition.
     """
 
+    class NullCache:
+        """No-op cache that skips all disk I/O. Used for batch video rendering."""
+        def __contains__(self, key): return False
+        def __getitem__(self, key): raise KeyError(key)
+        def __setitem__(self, key, value): pass
+        def __delitem__(self, key): pass
+        def clear(self): pass
+
     def __exit__(self, exc_type, exc_value, traceback):
         pass
 
+    # Class-level default: False for batch rendering, True for interactive preview
+    default_cache_enabled: bool = False
+
     def __init__(
-        self, size: tuple[int, int] = (1920, 1080), duration: float = 1.0, cache_directory: str = None
-) -> None:
+        self, size: tuple[int, int] = (1920, 1080), duration: float = 1.0,
+        cache_directory: str = None, enable_cache: bool = None
+    ) -> None:
         self._layers: list[LayerItem] = []
         self._name_to_layer: dict[str, LayerItem] = {}
         assert duration > 0, "duration must be positive"
         self._duration = duration
 
-        if cache_directory is not None:
-            self._cache: Cache = Cache(size_limit=1024 * 1024 * 1024, directory="cache")
+        # Resolve cache setting: explicit param > class default
+        use_cache = enable_cache if enable_cache is not None else Composition.default_cache_enabled
+
+        if use_cache:
+            directory = cache_directory if cache_directory else None
+            self._cache: Cache = Cache(size_limit=1024 * 1024 * 1024, directory=directory)
         else:
-            self._cache: Cache = Cache(size_limit=1024 * 1024 * 1024)
+            self._cache = Composition.NullCache()
 
         self._preview_level: int = 1
         assert isinstance(size, tuple) and len(size) == 2, "size must be a tuple of length 2"
