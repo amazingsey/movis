@@ -399,9 +399,13 @@ class Composition:
         if GPU_AVAILABLE and self._use_gpu and L == 1:
             frame = self._render_frame_gpu(time, bg_color)
         else:
-            # CPU path (original)
-            frame = np.empty(current_shape + (4,), dtype=np.uint8)
-            frame[:, :, :] = np.asarray(bg_color, dtype=np.uint8).reshape(1, 1, 4)
+            # CPU path — pre-allocate and reuse bg template
+            if not hasattr(self, '_bg_template') or self._bg_template.shape[:2] != current_shape or self._bg_color != bg_color:
+                self._bg_template = np.empty(current_shape + (4,), dtype=np.uint8)
+                self._bg_template[:, :, :] = np.asarray(bg_color, dtype=np.uint8).reshape(1, 1, 4)
+                self._bg_color = bg_color
+            frame = self._bg_template.copy()
+
             for layer_item in self._layers:
                 frame = layer_item._composite(
                     frame, time, preview_level=self._preview_level,
@@ -813,12 +817,16 @@ class LayerItem:
         self.audio: bool = audio
         self._effects: list[Effect] = []
 
-        # Static layer caching
-        self._static_ranges: list[tuple[float, float]] | None = None  # Computed lazily
+        # Static layer caching (transform-level)
+        self._static_ranges: list[tuple[float, float]] | None = None
         self._static_cache_fg: np.ndarray | None = None
         self._static_cache_offset: tuple[int, int] | None = None
         self._static_cache_opacity: float = 1.0
-        self._static_cache_range_idx: int = -1  # Which range produced the cache
+        self._static_cache_range_idx: int = -1
+
+        # Per-layer content cache (in-memory, keyed by layer content key)
+        # Avoids re-rendering static layers (Image, Text, PSD) every frame
+        self._content_cache: dict = {}
 
     @property
     def duration(self) -> float:
@@ -961,21 +969,30 @@ class LayerItem:
         return (transform_key, layer_key, effects_key)
 
     def _get_fg_image(self, time: float, cache: Cache | None = None) -> np.ndarray | None:
-        key = None
-        if cache is not None:
-            key_body = self.get_key(time)
-            key = (CacheType.LAYER, self.name, key_body)
-            if key in cache:
-                return cache[key]
+        layer_time = time - self.offset
+
+        # Content key: based on layer content + effects only (NOT transform)
+        # Static layers (Image, Text, PSD) return the same key every frame
+        layer_key = self.layer.get_key(layer_time) if hasattr(self.layer, 'get_key') else layer_time
+        effects_key = None
+        if self._effects:
+            effects_key = tuple(
+                e.get_key(layer_time) if hasattr(e, 'get_key') else layer_time
+                for e in self._effects
+            )
+        content_key = (layer_key, effects_key)
+
+        # Fast path: in-memory content cache (always on, no disk I/O)
+        if content_key in self._content_cache:
+            return self._content_cache[content_key]
+
+        # Render the layer
         fg_image = self(time)
         if fg_image is None:
             return None
-        assert isinstance(fg_image, np.ndarray), "Rendered layer image must be a numpy array"
-        assert fg_image.dtype == np.uint8, "Rendered layer image must have dtype=np.uint8"
-        assert fg_image.ndim == 3, "Rendered layer image must have 3 dimensions (H, W, C)"
-        assert fg_image.shape[2] == 4, "Rendered layer image must have 4 channels (RGBA)"
-        if key is not None:
-            cache[key] = fg_image
+
+        # Cache the rendered content in memory
+        self._content_cache[content_key] = fg_image
         return fg_image
 
     def _compute_static_ranges(self) -> list[tuple[float, float]]:
