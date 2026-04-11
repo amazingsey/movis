@@ -21,7 +21,8 @@ class Attribute:
     Regardless of ``value_type``, the returned type will always be ``numpy.ndarray``.
 
     .. note::
-        Even if it's scalar, the returned value will be an array like ``np.array([value])``.
+        Scalar attributes (SCALAR, ANGLE) return a Python ``float`` for NumPy 2.x compatibility.
+        Vector attributes (VECTOR2D, VECTOR3D, COLOR) still return ``numpy.ndarray``.
 
     Args:
         init_value:
@@ -57,9 +58,14 @@ class Attribute:
         self._motion = motion
         self._functions = [] if functions is None else list(functions)
 
-    def __call__(self, layer_time: float) -> np.ndarray:
+    def __call__(self, layer_time: float):
+        """Return the attribute value at the given time.
+
+        For scalar attributes (SCALAR, ANGLE): returns Python float (NumPy 2.x compatible).
+        For vector attributes (VECTOR2D, VECTOR3D, COLOR): returns np.ndarray.
+        """
         if self._motion is None and len(self._functions) == 0:
-            return transform_to_numpy(self._init_value, self._value_type)
+            value = transform_to_numpy(self._init_value, self._value_type)
         else:
             value = self._init_value
             if self._motion is not None:
@@ -69,10 +75,21 @@ class Attribute:
                 for func in self._functions:
                     value = transform_to_numpy(
                         func(value, layer_time), self._value_type)
-            if self._range is not None:
-                return np.clip(value, self._range[0], self._range[1])
-            else:
-                return value
+
+        if self._range is not None:
+            value = np.clip(value, self._range[0], self._range[1])
+
+        # NumPy 2.x compat: return Python scalar for scalar types
+        if self._value_type in (AttributeType.SCALAR, AttributeType.ANGLE):
+            if isinstance(value, np.ndarray):
+                return float(value.item())
+            return float(value)
+        return value
+
+    def scalar(self, layer_time: float) -> float:
+        """Explicitly get a Python scalar. Safe for scalar attributes."""
+        val = self(layer_time)
+        return float(val) if not isinstance(val, (int, float)) else val
 
     def get_values(self, layer_times: np.ndarray) -> np.ndarray:
         """Returns an array of values for the specified layer times.
@@ -212,20 +229,26 @@ class AttributesMixin:
         return tuple([transform_to_hashable(attr(time)) for attr in self.attributes.values()])
 
 
+def to_scalar(val) -> float:
+    """Safely convert to Python float. Handles ndarray, int, float."""
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, np.ndarray):
+        return float(val.item())
+    return float(val)
+
+
 def transform_to_hashable(
     x: float | Sequence[float] | np.ndarray
 ) -> float | tuple[float, ...]:
-    """Transform a scalar, tuple, list or numpy array to a hashable object used for caching.
-
-    Args:
-        x: The value to transform.
-
-    Returns:
-        A hashable object.
-    """
+    """Transform value to hashable for caching."""
     if isinstance(x, (int, float)):
         return float(x)
-    elif len(x) == 1:
+    if isinstance(x, np.ndarray):
+        x = x.flatten()
+        if len(x) == 1:
+            return float(x[0])
+        return tuple(float(v) for v in x)
+    if len(x) == 1:
         return float(x[0])
-    else:
-        return tuple([float(v) for v in x])
+    return tuple(float(v) for v in x)
