@@ -183,33 +183,21 @@ class Motion:
                 ``f: float -> float`` that satisfies ``f(0) == 0`` and ``f(1) == 1``.
                 The default is ``Easing.LINEAR`` (linear completion).
         """
-        keyframe = float(keyframe)
         i = bisect.bisect(self.keyframes, keyframe)
-        easing_func = self._convert_easing(easing)
-
         if 0 < i and self.keyframes[i - 1] == keyframe:
-            # Update existing keyframe (upsert)
-            self.values[i - 1] = transform_to_numpy(value, self.value_type)
-            self.easings[i - 1] = easing_func
-            return self
-
-        # Insert new keyframe
-        self.keyframes.insert(i, keyframe)
+            raise ValueError(f"Keyframe {keyframe} already exists")
+        self.keyframes.insert(i, float(keyframe))
         self.values.insert(i, transform_to_numpy(value, self.value_type))
+        if isinstance(easing, str):
+            easing_func = EASING_TO_FUNC[Easing.from_string(easing)]
+        elif isinstance(easing, Easing):
+            easing_func = EASING_TO_FUNC[easing]
+        elif callable(easing):
+            easing_func = easing
+        else:
+            raise ValueError(f"Invalid easing type: {type(easing)}")
         self.easings.insert(i, easing_func)
         return self
-
-    def _convert_easing(
-        self, easing: str | Easing | Callable[[float], float]
-    ) -> Callable[[float], float]:
-        """Convert easing specification to callable function."""
-        if isinstance(easing, str):
-            return EASING_TO_FUNC[Easing.from_string(easing)]
-        elif isinstance(easing, Easing):
-            return EASING_TO_FUNC[easing]
-        elif callable(easing):
-            return easing
-        raise ValueError(f"Invalid easing type: {type(easing)}")
 
     def extend(
         self,
@@ -253,27 +241,37 @@ class Motion:
             ["linear"] * len(keyframes) if easings is None else easings
         )
         converted_keyframes = [float(k) for k in keyframes]
+
+        # Check if given keyframes already exist
+        seen = set(self.keyframes)
+        for keyframe in converted_keyframes:
+            if keyframe in seen:
+                raise ValueError(f"Keyframe {keyframe} already exists")
+            seen.add(keyframe)
+
+        updated_keyframes: list[float] = self.keyframes + converted_keyframes
         converted_values = [
             transform_to_numpy(v, self.value_type) for v in values]
-        converted_easings = [self._convert_easing(t) for t in easings]
+        updated_values: list[np.ndarray[Any, np.dtype[np.float64]]] = self.values + converted_values
 
-        # Merge: new keyframes override existing ones at the same time
-        old_map = dict(zip(self.keyframes, zip(self.values, self.easings)))
+        def convert(t: str | Easing | Callable[[float], float]) -> Callable[[float], float]:
+            if callable(t):
+                return t
+            elif isinstance(t, Easing):
+                return EASING_TO_FUNC[t]
+            elif isinstance(t, str):
+                return EASING_TO_FUNC[Easing.from_string(t)]
+            else:
+                raise ValueError(f"Invalid easing type: {type(t)}")
 
-        # Last duplicate in the input list wins
-        new_map = {}
-        for kf, val, eas in zip(converted_keyframes, converted_values, converted_easings):
-            new_map[kf] = (val, eas)
+        converted_easings = [convert(t) for t in easings]
+        updated_easings: list[Callable[[float], float]] = self.easings + converted_easings
 
-        # Merge: new overrides old
-        merged_map = old_map.copy()
-        merged_map.update(new_map)
-
-        # Rebuild sorted lists
-        sorted_keyframes = sorted(merged_map.keys())
-        self.keyframes = sorted_keyframes
-        self.values = [merged_map[k][0] for k in sorted_keyframes]
-        self.easings = [merged_map[k][1] for k in sorted_keyframes]
+        zipped = sorted(zip(updated_keyframes, updated_values, updated_easings))
+        keyframes_sorted, values_sorted, easings_sorted = zip(*zipped)
+        self.keyframes = list(keyframes_sorted)
+        self.values = list(values_sorted)
+        self.easings = list(easings_sorted)
         return self
 
     def clear(self) -> "Motion":

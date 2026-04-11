@@ -472,14 +472,11 @@ class Text(AttributesMixin):
             raise ValueError(f"Invalid text type: {type(self.text)}")
 
     def _get_qfont(self, time: float) -> QFont:
-        # font_size() returns numpy array; .item() extracts the scalar
-        fs = self.font_size(time)
-        fs_val = round(float(fs.item() if hasattr(fs, 'item') else fs))
         if self.font_style is None:
-            return QFont(self.font_family, fs_val)
+            return QFont(self.font_family, round(float(self.font_size(time))))
         else:
             return QFontDatabase.font(
-                self.font_family, self.font_style, fs_val)
+                self.font_family, self.font_style, round(float(self.font_size(time))))
 
     def get_size(self, time: float = 0.) -> tuple[int, int]:
         """Returns the size of the text at the given time.
