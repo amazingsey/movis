@@ -13,6 +13,19 @@ from movis.imgproc import qimage_to_numpy
 
 from ..attribute import Attribute, AttributesMixin, AttributeType
 from ..enum import TextAlignment
+
+
+def _to_scalar(val) -> float:
+    """Extract a Python float from an Attribute return value.
+
+    Handles numpy 2.0+ which no longer allows float() on 1-d arrays.
+    Works with: float, int, 0-d ndarray, 1-element ndarray.
+    """
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, np.ndarray):
+        return float(val.item())
+    return float(val)
 from ..util import to_rgb
 from .mixin import TimelineMixin
 
@@ -192,7 +205,7 @@ class Rectangle(AttributesMixin):
             return None
         size = [float(x) for x in self.size(time)]
         w, h = float(size[0]), float(size[1])
-        radius = float(self.radius(time))
+        radius = _to_scalar(self.radius(time))
 
         eps = 1.
         max_stroke = _get_max_stroke(self.contents)
@@ -472,11 +485,11 @@ class Text(AttributesMixin):
             raise ValueError(f"Invalid text type: {type(self.text)}")
 
     def _get_qfont(self, time: float) -> QFont:
+        fs = round(_to_scalar(self.font_size(time)))
         if self.font_style is None:
-            return QFont(self.font_family, round(float(self.font_size(time))))
+            return QFont(self.font_family, fs)
         else:
-            return QFontDatabase.font(
-                self.font_family, self.font_style, round(float(self.font_size(time))))
+            return QFontDatabase.font(self.font_family, self.font_style, fs)
 
     def get_size(self, time: float = 0.) -> tuple[int, int]:
         """Returns the size of the text at the given time.
